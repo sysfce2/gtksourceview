@@ -10,7 +10,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: gtksourceview\n"
 "Report-Msgid-Bugs-To: https://gitlab.gnome.org/GNOME/gtksourceview/issues\n"
-"POT-Creation-Date: 2025-08-12 03:21+0000\n"
+"POT-Creation-Date: 2026-02-09 20:24+0000\n"
 "PO-Revision-Date: 2025-08-13 06:51+0200\n"
 "Last-Translator: Dušan Kazik <prescott66@gmail.com>\n"
 "Language-Team: Slovak <gnome-sk-list@gnome.org>\n"
@@ -3614,7 +3614,7 @@ msgstr "-- VIZUÁLNE BLOKOVO --"
 
 # poperty blurb
 #~ msgid "Name of the font to use for the text body (e.g. \"Monospace 10\")"
-#~ msgstr "Názov písma, ktoré použiť pre text tela (napr. \"Monospace 10\")"
+#~ msgstr "Názov písma, ktoré použiť pre text tela (napr. „Monospace 10“)"
 
 # poperty nick
 #~ msgid "Line Numbers Font Name"
@@ -3623,7 +3623,7 @@ msgstr "-- VIZUÁLNE BLOKOVO --"
 # poperty blurb
 #~ msgid "Name of the font to use for the line numbers (e.g. \"Monospace 10\")"
 #~ msgstr ""
-#~ "Názov písma, ktoré použiť pre číslovanie riadkov (napr. \"Monospace 10\")"
+#~ "Názov písma, ktoré použiť pre číslovanie riadkov (napr. „Monospace 10“)"
 
 # poperty nick
 #~ msgid "Header Font Name"
@@ -3632,7 +3632,7 @@ msgstr "-- VIZUÁLNE BLOKOVO --"
 # poperty blurb
 #~ msgid "Name of the font to use for the page header (e.g. \"Monospace 10\")"
 #~ msgstr ""
-#~ "Názov písma, ktoré použiť pre hlavičku strany (napr. \"Monospace 10\")"
+#~ "Názov písma, ktoré použiť pre hlavičku strany (napr. „Monospace 10“)"
 
 # poperty nick
 #~ msgid "Footer Font Name"
@@ -3640,7 +3640,7 @@ msgstr "-- VIZUÁLNE BLOKOVO --"
 
 # poperty blurb
 #~ msgid "Name of the font to use for the page footer (e.g. \"Monospace 10\")"
-#~ msgstr "Názov písma, ktoré použiť pre pätu strany (napr. \"Monospace 10\")"
+#~ msgstr "Názov písma, ktoré použiť pre pätu strany (napr. „Monospace 10“)"
 
 # poperty nick
 #~ msgid "Number of pages"
