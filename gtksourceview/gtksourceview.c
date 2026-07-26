@@ -2670,7 +2670,7 @@ gtk_source_view_paint_marks_background (GtkSourceView *view,
 		gtk_text_view_get_line_yrange (text_view, &iter, &y, &height);
 
 		g_array_append_val (pixels, y);
-		g_array_append_val (pixels, height);
+		g_array_append_val (heights, height);
 		g_array_append_val (numbers, n);
 		count = 1;
 	}
