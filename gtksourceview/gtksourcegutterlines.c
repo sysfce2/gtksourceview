@@ -38,25 +38,42 @@
  * frames-per-second while performing kinetic scrolling.
  */
 
-struct _GtkSourceGutterLines
-{
-	GObject           parent_instance;
-	GtkTextView      *view;
-	GArray           *lines;
-	double            visible_offset;
-	guint             first;
-	guint             last;
-	guint             cursor_line;
-};
-
 typedef struct
 {
 	QuarkSet classes;
-	gint     y;
-	gint     height;
-	gint     first_height;
-	gint     last_height;
+	int      y;
+	int      height;
+	int      first_height;
+	int      last_height;
 } LineInfo;
+
+static void
+clear_line_info (LineInfo *info)
+{
+	info->y = 0;
+	info->height = 0;
+	quark_set_clear (&info->classes);
+}
+
+#define GDK_ARRAY_NAME line_infos
+#define GDK_ARRAY_TYPE_NAME LineInfos
+#define GDK_ARRAY_ELEMENT_TYPE LineInfo
+#define GDK_ARRAY_FREE_FUNC clear_line_info
+#define GDK_ARRAY_BY_VALUE 1
+#define GDK_ARRAY_PREALLOC 64
+#define GDK_ARRAY_NO_MEMSET 1
+#include "gdkarrayimpl.c"
+
+struct _GtkSourceGutterLines
+{
+	GObject      parent_instance;
+	GtkTextView *view;
+	LineInfos    lines;
+	double       visible_offset;
+	guint        first;
+	guint        last;
+	guint        cursor_line;
+};
 
 G_DEFINE_TYPE (GtkSourceGutterLines, gtk_source_gutter_lines, G_TYPE_OBJECT)
 
@@ -69,7 +86,7 @@ gtk_source_gutter_lines_finalize (GObject *object)
 {
 	GtkSourceGutterLines *lines = (GtkSourceGutterLines *)object;
 
-	g_clear_pointer (&lines->lines, g_array_unref);
+	line_infos_clear (&lines->lines);
 	g_clear_weak_pointer (&lines->view);
 
 	G_OBJECT_CLASS (gtk_source_gutter_lines_parent_class)->finalize (object);
@@ -90,17 +107,8 @@ gtk_source_gutter_lines_class_init (GtkSourceGutterLinesClass *klass)
 static void
 gtk_source_gutter_lines_init (GtkSourceGutterLines *self)
 {
+	line_infos_init (&self->lines);
 	self->cursor_line = -1;
-}
-
-static void
-clear_line_info (gpointer data)
-{
-	LineInfo *info = data;
-
-	info->y = 0;
-	info->height = 0;
-	quark_set_clear (&info->classes);
 }
 
 GtkSourceGutterLines *
@@ -151,11 +159,7 @@ _gtk_source_gutter_lines_new (GtkTextView       *text_view,
 	g_set_weak_pointer (&lines->view, text_view);
 	lines->first = gtk_text_iter_get_line (begin);
 	lines->last = gtk_text_iter_get_line (end);
-	lines->lines = g_array_sized_new (FALSE,
-	                                  FALSE,
-	                                  sizeof (LineInfo),
-	                                  lines->last - lines->first + 1);
-	g_array_set_clear_func (lines->lines, clear_line_info);
+	line_infos_reserve (&lines->lines, lines->last - lines->first + 1);
 
 	gtk_text_view_get_visible_offset (text_view, NULL, &lines->visible_offset);
 
@@ -265,7 +269,7 @@ _gtk_source_gutter_lines_new (GtkTextView       *text_view,
 			quark_set_add (&info.classes, q_selected);
 		}
 
-		g_array_append_val (lines->lines, info);
+		line_infos_append (&lines->lines, &info);
 
 		if G_UNLIKELY (!gtk_text_iter_forward_line (&iter) &&
 			       !gtk_text_iter_is_end (&iter))
@@ -274,8 +278,9 @@ _gtk_source_gutter_lines_new (GtkTextView       *text_view,
 		}
 	}
 
-	g_return_val_if_fail (lines->lines->len > 0, NULL);
-	g_return_val_if_fail ((lines->last - lines->first) >= (lines->lines->len - 1), NULL);
+	g_return_val_if_fail (!line_infos_is_empty (&lines->lines), NULL);
+	g_return_val_if_fail ((lines->last - lines->first) >=
+	                      (line_infos_get_size (&lines->lines) - 1), NULL);
 
 	return g_steal_pointer (&lines);
 }
@@ -305,9 +310,9 @@ gtk_source_gutter_lines_add_qclass (GtkSourceGutterLines *lines,
 	g_return_if_fail (qname != 0);
 	g_return_if_fail (line >= lines->first);
 	g_return_if_fail (line <= lines->last);
-	g_return_if_fail (line - lines->first < lines->lines->len);
+	g_return_if_fail (line - lines->first < line_infos_get_size (&lines->lines));
 
-	info = &g_array_index (lines->lines, LineInfo, line - lines->first);
+	info = line_infos_get (&lines->lines, line - lines->first);
 	quark_set_add (&info->classes, qname);
 }
 
@@ -385,9 +390,9 @@ gtk_source_gutter_lines_remove_qclass (GtkSourceGutterLines *lines,
 	g_return_if_fail (qname != 0);
 	g_return_if_fail (line >= lines->first);
 	g_return_if_fail (line <= lines->last);
-	g_return_if_fail (line - lines->first < lines->lines->len);
+	g_return_if_fail (line - lines->first < line_infos_get_size (&lines->lines));
 
-	info = &g_array_index (lines->lines, LineInfo, line - lines->first);
+	info = line_infos_get (&lines->lines, line - lines->first);
 	quark_set_remove (&info->classes, qname);
 }
 
@@ -447,9 +452,9 @@ gtk_source_gutter_lines_has_qclass (GtkSourceGutterLines *lines,
 	g_return_val_if_fail (qname != 0, FALSE);
 	g_return_val_if_fail (line >= lines->first, FALSE);
 	g_return_val_if_fail (line <= lines->last, FALSE);
-	g_return_val_if_fail (line - lines->first < lines->lines->len, FALSE);
+	g_return_val_if_fail (line - lines->first < line_infos_get_size (&lines->lines), FALSE);
 
-	info = &g_array_index (lines->lines, LineInfo, line - lines->first);
+	info = line_infos_get (&lines->lines, line - lines->first);
 
 	return quark_set_contains (&info->classes, qname);
 }
@@ -620,7 +625,7 @@ gtk_source_gutter_lines_get_line_extent (GtkSourceGutterLines                 *l
 	g_return_if_fail (line >= lines->first);
 	g_return_if_fail (line <= lines->last);
 
-	info = &g_array_index (lines->lines, LineInfo, line - lines->first);
+	info = line_infos_get (&lines->lines, line - lines->first);
 
 	if (mode == GTK_SOURCE_GUTTER_RENDERER_ALIGNMENT_MODE_CELL)
 	{
@@ -704,8 +709,13 @@ gboolean
 gtk_source_gutter_lines_has_any_class (GtkSourceGutterLines *lines,
                                        guint                 line)
 {
-	if (lines == NULL || line < lines->first || line > lines->last || line - lines->first >= lines->lines->len)
-    return FALSE;
+	if (lines == NULL ||
+	    line < lines->first ||
+	    line > lines->last ||
+	    line - lines->first >= line_infos_get_size (&lines->lines))
+	{
+		return FALSE;
+	}
 
-  return g_array_index (lines->lines, LineInfo, line - lines->first).classes.len > 0;
+	return line_infos_get (&lines->lines, line - lines->first)->classes.len > 0;
 }
