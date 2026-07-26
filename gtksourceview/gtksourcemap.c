@@ -175,12 +175,15 @@ typedef struct
 
 	/* The location of the slider in widget coordinate space. */
 	GdkRectangle slider_area;
+	int slider_width;
 
-	/* We compare against old values from the vadjustment as it can
-	 * notify a bit more than is necessary.
-	 */
-	double last_vadj_upper;
-	double last_vadj_value;
+	/* Cached measurements which are invalidated by CSS or context changes. */
+	PangoContext *width_context;
+	guint width_context_serial;
+	guint width_right_margin_position;
+	int width_left_margin;
+	int width_request;
+	int slider_min_height;
 
 	/* Weak pointer view to child view bindings */
 	GBinding *buffer_binding;
@@ -193,7 +196,7 @@ typedef struct
 	gulong view_notify_buffer_handler;
 	gulong view_notify_right_margin_position_handler;
 	gulong view_vadj_value_changed_handler;
-	gulong view_vadj_notify_upper_handler;
+	gulong view_vadj_changed_handler;
 
 	/* Signals connected indirectly to the buffer */
 	gulong buffer_notify_style_scheme_handler;
@@ -203,8 +206,11 @@ typedef struct
 	 */
 	guint update_id;
 
-	/* Denotes if we are in a grab from button press */
-	guint in_press : 1;
+	/* Whether editor adjustment handlers are currently blocked. */
+	guint adjustment_handlers_blocked : 1;
+
+	/* Whether slider_area describes the current child allocation. */
+	guint slider_allocated : 1;
 
 	/* If we failed to locate a color for the slider, then this will
 	 * be set to 0 and that means we need to apply the "selection"
@@ -233,52 +239,59 @@ static GParamSpec *properties[N_PROPERTIES];
 
 static void
 get_slider_position (GtkSourceMap *map,
-                     int           width,
                      int           height,
                      GdkRectangle *slider_area)
 {
 	GtkSourceMapPrivate *priv = gtk_source_map_get_instance_private (map);
-	GdkRectangle them_visible_rect, us_visible_rect;
-	GtkTextBuffer *buffer;
-	GtkTextIter end_iter;
-	GdkRectangle end_rect;
-	GtkBorder border;
-	int us_height;
-	int us_width;
-	int them_height;
+	GtkAdjustment *child_vadj;
+	GtkAdjustment *vadj;
+	double child_lower;
+	double child_upper;
+	double child_value;
+	double lower;
+	double upper;
+	double value;
+	double page_size;
+	double range;
+	double child_range;
+	double slider_height;
+	double slider_y;
 
-	if (priv->view == NULL)
-	{
-		return;
-	}
+	g_assert (GTK_SOURCE_IS_MAP (map));
+	g_assert (slider_area != NULL);
+	g_assert (priv->view != NULL);
 
-	us_width = gtk_widget_get_width (GTK_WIDGET (map));
+	vadj = gtk_scrollable_get_vadjustment (GTK_SCROLLABLE (priv->view));
+	child_vadj = gtk_scrollable_get_vadjustment (GTK_SCROLLABLE (map));
 
-	buffer = gtk_text_view_get_buffer (GTK_TEXT_VIEW (map));
+	lower = gtk_adjustment_get_lower (vadj);
+	upper = gtk_adjustment_get_upper (vadj);
+	value = gtk_adjustment_get_value (vadj);
+	page_size = gtk_adjustment_get_page_size (vadj);
+	range = upper - lower;
 
-	G_GNUC_BEGIN_IGNORE_DEPRECATIONS {
-		GtkStyleContext *style_context;
-
-		style_context = gtk_widget_get_style_context (GTK_WIDGET (map));
-		gtk_style_context_get_border (style_context, &border);
-	} G_GNUC_END_IGNORE_DEPRECATIONS
-
-	gtk_text_buffer_get_end_iter (buffer, &end_iter);
-	gtk_text_view_get_iter_location (GTK_TEXT_VIEW (map), &end_iter, &end_rect);
-	us_height = end_rect.y + end_rect.height;
-	gtk_text_view_get_iter_location (GTK_TEXT_VIEW (priv->view), &end_iter, &end_rect);
-	them_height = end_rect.y + end_rect.height;
-
-	gtk_text_view_get_visible_rect (GTK_TEXT_VIEW (priv->view), &them_visible_rect);
-	gtk_text_view_get_visible_rect (GTK_TEXT_VIEW (map), &us_visible_rect);
+	child_lower = gtk_adjustment_get_lower (child_vadj);
+	child_upper = gtk_adjustment_get_upper (child_vadj);
+	child_value = gtk_adjustment_get_value (child_vadj);
+	child_range = child_upper - child_lower;
 
 	slider_area->x = 0;
-	slider_area->width = us_width - border.left - border.right;
-	slider_area->height = 100;
-	slider_area->y = (double)them_visible_rect.y / (double)them_height * (double)us_height;
-	slider_area->height = ((double)(them_visible_rect.y + them_visible_rect.height) / (double)them_height * (double)us_height) - slider_area->y;
+	slider_area->width = priv->slider_width;
 
-	slider_area->y -= us_visible_rect.y;
+	if (range <= 0.0 || child_range <= 0.0 || page_size >= range)
+	{
+		slider_y = 0.0;
+		slider_height = height;
+	}
+	else
+	{
+		slider_y = ((CLAMP (value, lower, upper) - lower) / range) * child_range;
+		slider_y -= child_value - child_lower;
+		slider_height = CLAMP (page_size / range, 0.0, 1.0) * child_range;
+	}
+
+	slider_area->y = floor (slider_y);
+	slider_area->height = ceil (slider_height);
 }
 
 static void
@@ -286,22 +299,42 @@ gtk_source_map_allocate_slider (GtkSourceMap *map)
 {
 	GtkSourceMapPrivate *priv = gtk_source_map_get_instance_private (map);
 	GdkRectangle area;
-	int width, height;
-	int min, nat;
+	int height;
+	int width;
 
 	g_assert (GTK_SOURCE_IS_MAP (map));
 
 	width = gtk_widget_get_width (GTK_WIDGET (map));
 	height = gtk_widget_get_height (GTK_WIDGET (map));
 
-	if (width == 0 || height == 0)
+	if (priv->view == NULL || width == 0 || height == 0)
 		return;
 
-	get_slider_position (map, width, height, &area);
-	gtk_widget_measure (GTK_WIDGET (priv->slider),
-	                    GTK_ORIENTATION_VERTICAL,
-	                    width, &min, &nat, NULL, NULL);
-	area.height = MAX (nat, area.height);
+	get_slider_position (map, height, &area);
+
+	if (priv->slider_min_height < 0)
+	{
+		gtk_widget_measure (GTK_WIDGET (priv->slider),
+		                    GTK_ORIENTATION_VERTICAL,
+		                    priv->slider_width,
+		                    NULL,
+		                    &priv->slider_min_height,
+		                    NULL,
+		                    NULL);
+		priv->slider_min_height = MAX (SCRUBBER_MIN_HEIGHT, priv->slider_min_height);
+	}
+
+	area.height = CLAMP (MAX (priv->slider_min_height, area.height), 0, height);
+	area.y = CLAMP (area.y, 0, height - area.height);
+
+	if (priv->slider_allocated &&
+	    gdk_rectangle_equal (&priv->slider_area, &area))
+	{
+		return;
+	}
+
+	priv->slider_area = area;
+	priv->slider_allocated = TRUE;
 	gtk_widget_size_allocate (GTK_WIDGET (priv->slider), &area, -1);
 }
 
@@ -526,53 +559,61 @@ static void
 update_child_vadjustment (GtkSourceMap *map)
 {
 	GtkSourceMapPrivate *priv = gtk_source_map_get_instance_private (map);
-	GtkAdjustment *vadj;
 	GtkAdjustment *child_vadj;
-	gdouble value;
-	gdouble upper;
-	gdouble page_size;
-	gdouble child_upper;
-	gdouble child_page_size;
-	gdouble new_value = 0.0;
+	GtkAdjustment *vadj;
+	double child_lower;
+	double child_range;
+	double child_upper;
+	double child_page_size;
+	double lower;
+	double range;
+	double upper;
+	double page_size;
+	double value;
+	double new_value;
+
+	g_assert (GTK_SOURCE_IS_MAP (map));
+	g_assert (priv->view != NULL);
 
 	vadj = gtk_scrollable_get_vadjustment (GTK_SCROLLABLE (priv->view));
-	g_object_get (vadj,
-	              "upper", &upper,
-	              "value", &value,
-	              "page-size", &page_size,
-	              NULL);
-
 	child_vadj = gtk_scrollable_get_vadjustment (GTK_SCROLLABLE (map));
-	g_object_get (child_vadj,
-	              "upper", &child_upper,
-	              "page-size", &child_page_size,
-	              NULL);
 
-	/*
-	 * FIXME:
-	 * Technically we should take into account lower here, but in practice
-	 *       it is always 0.0.
-	 */
-	if (child_page_size < child_upper)
+	lower = gtk_adjustment_get_lower (vadj);
+	upper = gtk_adjustment_get_upper (vadj);
+	value = gtk_adjustment_get_value (vadj);
+	page_size = gtk_adjustment_get_page_size (vadj);
+	range = MAX (0.0, upper - lower - page_size);
+
+	child_lower = gtk_adjustment_get_lower (child_vadj);
+	child_upper = gtk_adjustment_get_upper (child_vadj);
+	child_page_size = gtk_adjustment_get_page_size (child_vadj);
+	child_range = MAX (0.0, child_upper - child_lower - child_page_size);
+	new_value = child_lower;
+
+	if (range > 0.0 && child_range > 0.0)
 	{
-		new_value = (value / (upper - page_size)) * (child_upper - child_page_size);
+		double ratio = (CLAMP (value, lower, lower + range) - lower) / range;
+
+		new_value += ratio * child_range;
 	}
 
 	gtk_adjustment_set_value (child_vadj, new_value);
-
-	gtk_source_map_allocate_slider (map);
 }
 
 static gboolean
 gtk_source_map_do_update (GtkWidget     *widget,
                           GdkFrameClock *frame_clock,
-			  gpointer       user_data)
+                          gpointer       user_data)
 {
 	GtkSourceMap *map = GTK_SOURCE_MAP (widget);
 	GtkSourceMapPrivate *priv = gtk_source_map_get_instance_private (map);
 
+	g_assert (GDK_IS_FRAME_CLOCK (frame_clock));
+
 	priv->update_id = 0;
 	update_child_vadjustment (map);
+	gtk_source_map_allocate_slider (map);
+
 	return G_SOURCE_REMOVE;
 }
 
@@ -582,6 +623,12 @@ gtk_source_map_queue_update (GtkSourceMap *map)
 	GtkSourceMapPrivate *priv = gtk_source_map_get_instance_private (map);
 
 	g_assert (GTK_SOURCE_IS_MAP (map));
+
+	if (priv->view == NULL ||
+	    !gtk_widget_get_mapped (GTK_WIDGET (map)))
+	{
+		return;
+	}
 
 	if (priv->update_id == 0)
 	{
@@ -593,32 +640,27 @@ gtk_source_map_queue_update (GtkSourceMap *map)
 }
 
 static void
-view_vadj_value_changed (GtkSourceMap  *map,
-                         GtkAdjustment *vadj)
+gtk_source_map_cancel_update (GtkSourceMap *map)
 {
 	GtkSourceMapPrivate *priv = gtk_source_map_get_instance_private (map);
-	double value = gtk_adjustment_get_value (vadj);
 
-	if (value != priv->last_vadj_value)
+	g_assert (GTK_SOURCE_IS_MAP (map));
+
+	if (priv->update_id != 0)
 	{
-		priv->last_vadj_value = value;
-		gtk_source_map_queue_update (map);
+		gtk_widget_remove_tick_callback (GTK_WIDGET (map), priv->update_id);
+		priv->update_id = 0;
 	}
 }
 
 static void
-view_vadj_notify_upper (GtkSourceMap  *map,
-                        GParamSpec    *pspec,
-                        GtkAdjustment *vadj)
+view_vadj_changed (GtkSourceMap  *map,
+                   GtkAdjustment *vadj)
 {
-	GtkSourceMapPrivate *priv = gtk_source_map_get_instance_private (map);
-	double upper = gtk_adjustment_get_upper (vadj);
+	g_assert (GTK_SOURCE_IS_MAP (map));
+	g_assert (GTK_IS_ADJUSTMENT (vadj));
 
-	if (upper != priv->last_vadj_upper)
-	{
-		priv->last_vadj_upper = upper;
-		gtk_source_map_queue_update (map);
-	}
+	gtk_source_map_queue_update (map);
 }
 
 static void
@@ -697,6 +739,18 @@ view_notify_buffer (GtkSourceMap  *map,
 }
 
 static void
+gtk_source_map_invalidate_width (GtkSourceMap *map)
+{
+	GtkSourceMapPrivate *priv = gtk_source_map_get_instance_private (map);
+
+	g_assert (GTK_SOURCE_IS_MAP (map));
+
+	priv->width_request = -1;
+	g_clear_object (&priv->width_context);
+	gtk_widget_queue_resize (GTK_WIDGET (map));
+}
+
+static void
 gtk_source_map_set_font_desc (GtkSourceMap               *map,
                               const PangoFontDescription *font_desc)
 {
@@ -719,12 +773,13 @@ gtk_source_map_set_font_desc (GtkSourceMap               *map,
 		}
 	}
 
+	gtk_source_map_invalidate_width (map);
 	gtk_source_map_rebuild_css (map);
 }
 
 static void
 gtk_source_map_set_font_name (GtkSourceMap *map,
-                              const gchar  *font_name)
+                              const char   *font_name)
 {
 	PangoFontDescription *font_desc;
 
@@ -754,6 +809,7 @@ gtk_source_map_measure (GtkWidget      *widget,
 
 	if (priv->view == NULL)
 	{
+		*minimum = *natural = 0;
 		return;
 	}
 
@@ -765,36 +821,40 @@ gtk_source_map_measure (GtkWidget      *widget,
 		}
 		else
 		{
-			PangoLayout *layout;
-			char *text;
+			PangoContext *context;
 			guint right_margin_position;
-			int height;
-			int width;
+			guint context_serial;
+			int left_margin;
 
 			right_margin_position = gtk_source_view_get_right_margin_position (priv->view);
+			left_margin = gtk_text_view_get_left_margin (GTK_TEXT_VIEW (map));
+			context = gtk_widget_get_pango_context (widget);
+			context_serial = pango_context_get_serial (context);
 
-			text = g_malloc (right_margin_position + 1);
-			memset (text, 'X', right_margin_position);
-			text[right_margin_position] = 0;
+			if (priv->width_request < 0 ||
+			    priv->width_context != context ||
+			    priv->width_context_serial != context_serial ||
+			    priv->width_right_margin_position != right_margin_position ||
+			    priv->width_left_margin != left_margin)
+			{
+				g_autoptr(PangoLayout) layout = NULL;
+				g_autofree char *text = NULL;
 
-			/*
-			 * FIXME:
-			 *
-			 * This seems like the type of thing we should calculate when
-			 * rebuilding our CSS since it gets used a bunch and changes
-			 * very little.
-			 */
-			layout = gtk_widget_create_pango_layout (GTK_WIDGET (map), text);
-			pango_layout_get_pixel_size (layout, &width, &height);
-			g_object_unref (layout);
-			g_free (text);
+				text = g_strnfill (right_margin_position, 'X');
+				layout = gtk_widget_create_pango_layout (widget, text);
+				pango_layout_get_pixel_size (layout, &priv->width_request, NULL);
 
-			/* If left-margin is set, try to balance the right side with the same amount
-			 * of additional space to keep it aligned.
-			 */
-			width += (gtk_text_view_get_left_margin (GTK_TEXT_VIEW (map)) * 2);
+				/* If left-margin is set, try to balance the right side with the same
+				 * amount of additional space to keep it aligned.
+				 */
+				priv->width_request += left_margin * 2;
+				g_set_object (&priv->width_context, context);
+				priv->width_context_serial = context_serial;
+				priv->width_right_margin_position = right_margin_position;
+				priv->width_left_margin = left_margin;
+			}
 
-			*minimum = *natural = width;
+			*minimum = *natural = priv->width_request;
 		}
 	}
 	else if (orientation == GTK_ORIENTATION_VERTICAL)
@@ -844,6 +904,37 @@ scale_margin (GBinding *binding,
 	int scaled_margin = source_value_int / 4.35;
 	g_value_set_int (target_value, scaled_margin);
 	return TRUE;
+}
+
+static void
+gtk_source_map_set_adjustment_handlers_blocked (GtkSourceMap *map,
+                                                gboolean      blocked)
+{
+	GtkSourceMapPrivate *priv = gtk_source_map_get_instance_private (map);
+	GtkAdjustment *vadj;
+
+	g_assert (GTK_SOURCE_IS_MAP (map));
+
+	if (priv->view == NULL ||
+	    priv->adjustment_handlers_blocked == blocked)
+	{
+		return;
+	}
+
+	vadj = gtk_scrollable_get_vadjustment (GTK_SCROLLABLE (priv->view));
+
+	if (blocked)
+	{
+		g_signal_handler_block (vadj, priv->view_vadj_value_changed_handler);
+		g_signal_handler_block (vadj, priv->view_vadj_changed_handler);
+	}
+	else
+	{
+		g_signal_handler_unblock (vadj, priv->view_vadj_value_changed_handler);
+		g_signal_handler_unblock (vadj, priv->view_vadj_changed_handler);
+	}
+
+	priv->adjustment_handlers_blocked = blocked;
 }
 
 static void
@@ -923,24 +1014,21 @@ connect_view (GtkSourceMap  *map,
 	priv->view_vadj_value_changed_handler =
 		g_signal_connect_object (vadj,
 		                         "value-changed",
-		                         G_CALLBACK (view_vadj_value_changed),
+		                         G_CALLBACK (view_vadj_changed),
 		                         map,
 		                         G_CONNECT_SWAPPED);
 
-	priv->view_vadj_notify_upper_handler =
+	priv->view_vadj_changed_handler =
 		g_signal_connect_object (vadj,
-		                         "notify::upper",
-		                         G_CALLBACK (view_vadj_notify_upper),
+		                         "changed",
+		                         G_CALLBACK (view_vadj_changed),
 		                         map,
 		                         G_CONNECT_SWAPPED);
 
-	/* If we are not visible, we want to block certain signal handlers */
-	if (!gtk_widget_get_visible (GTK_WIDGET (map)))
-	{
-		g_signal_handler_block (vadj, priv->view_vadj_value_changed_handler);
-		g_signal_handler_block (vadj, priv->view_vadj_notify_upper_handler);
-	}
+	gtk_source_map_set_adjustment_handlers_blocked (map,
+	                                                !gtk_widget_get_mapped (GTK_WIDGET (map)));
 
+	gtk_source_map_invalidate_width (map);
 	gtk_source_map_rebuild_css (map);
 }
 
@@ -957,6 +1045,7 @@ disconnect_view (GtkSourceMap *map)
 		return;
 	}
 
+	gtk_source_map_cancel_update (map);
 	disconnect_buffer (map);
 
 	if (priv->buffer_binding != NULL)
@@ -1008,12 +1097,15 @@ disconnect_view (GtkSourceMap *map)
 		g_signal_handler_disconnect (vadj, priv->view_vadj_value_changed_handler);
 		priv->view_vadj_value_changed_handler = 0;
 
-		g_signal_handler_disconnect (vadj, priv->view_vadj_notify_upper_handler);
-		priv->view_vadj_notify_upper_handler = 0;
+		g_signal_handler_disconnect (vadj, priv->view_vadj_changed_handler);
+		priv->view_vadj_changed_handler = 0;
 	}
 
 	g_object_remove_weak_pointer (G_OBJECT (priv->view), (gpointer *)&priv->view);
 	priv->view = NULL;
+	priv->adjustment_handlers_blocked = FALSE;
+	priv->slider_allocated = FALSE;
+	gtk_source_map_invalidate_width (map);
 }
 
 static void
@@ -1025,7 +1117,10 @@ gtk_source_map_dispose (GObject *object)
 	disconnect_buffer (map);
 	disconnect_view (map);
 
+	gtk_source_map_cancel_update (map);
+
 	g_clear_object (&priv->css_provider);
+	g_clear_object (&priv->width_context);
 	g_clear_pointer (&priv->font_desc, pango_font_description_free);
 
 	if (priv->slider)
@@ -1196,6 +1291,7 @@ gtk_source_map_drag_end (GtkSourceMap   *map,
 {
 	GtkSourceMapPrivate *priv = gtk_source_map_get_instance_private (map);
 
+	gtk_source_map_queue_update (map);
 	gtk_widget_remove_css_class (GTK_WIDGET (priv->slider), "dragging");
 }
 
@@ -1246,6 +1342,7 @@ gtk_source_map_click_pressed (GtkSourceMap *map,
 	gtk_text_view_get_iter_at_location (GTK_TEXT_VIEW (map), &iter, 0, buffer_y);
 	gtk_text_view_scroll_to_iter (GTK_TEXT_VIEW (priv->view), &iter,
 	                              0.0, TRUE, 1.0, 0.5);
+	gtk_source_map_queue_update (map);
 }
 
 static gboolean
@@ -1306,54 +1403,41 @@ gtk_source_map_realize (GtkWidget *widget)
 }
 
 static void
-gtk_source_map_show (GtkWidget *widget)
+gtk_source_map_map (GtkWidget *widget)
 {
 	GtkSourceMap *map = GTK_SOURCE_MAP (widget);
-	GtkSourceMapPrivate *priv;
-	GtkAdjustment *vadj;
 
-	GTK_WIDGET_CLASS (gtk_source_map_parent_class)->show (widget);
+	GTK_WIDGET_CLASS (gtk_source_map_parent_class)->map (widget);
 
-	priv = gtk_source_map_get_instance_private (map);
-
-	if (priv->view != NULL)
-	{
-		vadj = gtk_scrollable_get_vadjustment (GTK_SCROLLABLE (priv->view));
-
-		g_signal_handler_unblock (vadj, priv->view_vadj_value_changed_handler);
-		g_signal_handler_unblock (vadj, priv->view_vadj_notify_upper_handler);
-
-		g_object_notify (G_OBJECT (vadj), "upper");
-		g_signal_emit_by_name (vadj, "value-changed");
-	}
+	gtk_source_map_set_adjustment_handlers_blocked (map, FALSE);
+	gtk_source_map_queue_update (map);
 }
 
 static void
-gtk_source_map_hide (GtkWidget *widget)
+gtk_source_map_unmap (GtkWidget *widget)
 {
 	GtkSourceMap *map = GTK_SOURCE_MAP (widget);
-	GtkSourceMapPrivate *priv;
-	GtkAdjustment *vadj;
 
-	GTK_WIDGET_CLASS (gtk_source_map_parent_class)->hide (widget);
+	gtk_source_map_set_adjustment_handlers_blocked (map, TRUE);
+	gtk_source_map_cancel_update (map);
 
-	priv = gtk_source_map_get_instance_private (map);
-
-	if (priv->view != NULL)
-	{
-		vadj = gtk_scrollable_get_vadjustment (GTK_SCROLLABLE (priv->view));
-		g_signal_handler_block (vadj, priv->view_vadj_value_changed_handler);
-		g_signal_handler_block (vadj, priv->view_vadj_notify_upper_handler);
-	}
+	GTK_WIDGET_CLASS (gtk_source_map_parent_class)->unmap (widget);
 }
 
 static void
 gtk_source_map_css_changed (GtkWidget         *widget,
                             GtkCssStyleChange *change)
 {
+	GtkSourceMapPrivate *priv = gtk_source_map_get_instance_private (GTK_SOURCE_MAP (widget));
+
 	g_assert (GTK_IS_WIDGET (widget));
 
 	GTK_WIDGET_CLASS (gtk_source_map_parent_class)->css_changed (widget, change);
+
+	gtk_source_map_invalidate_width (GTK_SOURCE_MAP (widget));
+
+	priv->slider_min_height = -1;
+	priv->slider_allocated = FALSE;
 
 #if GTK_CHECK_VERSION(4,3,1)
 	{
@@ -1380,11 +1464,20 @@ gtk_source_map_size_allocate (GtkWidget *widget,
                               int        baseline)
 {
 	GtkSourceMap *map = (GtkSourceMap *)widget;
+	GtkSourceMapPrivate *priv = gtk_source_map_get_instance_private (map);
+	GtkBorder border;
 
 	g_assert (GTK_SOURCE_IS_MAP (map));
 
 	GTK_WIDGET_CLASS (gtk_source_map_parent_class)->size_allocate (widget, width, height, baseline);
 
+	G_GNUC_BEGIN_IGNORE_DEPRECATIONS {
+		GtkStyleContext *style_context = gtk_widget_get_style_context (widget);
+
+		gtk_style_context_get_border (style_context, &border);
+	} G_GNUC_END_IGNORE_DEPRECATIONS
+
+	priv->slider_width = MAX (0, width - border.left - border.right);
 	gtk_source_map_allocate_slider (map);
 }
 
@@ -1434,8 +1527,8 @@ gtk_source_map_class_init (GtkSourceMapClass *klass)
 	object_class->set_property = gtk_source_map_set_property;
 
 	widget_class->measure = gtk_source_map_measure;
-	widget_class->hide = gtk_source_map_hide;
-	widget_class->show = gtk_source_map_show;
+	widget_class->map = gtk_source_map_map;
+	widget_class->unmap = gtk_source_map_unmap;
 	widget_class->state_flags_changed = gtk_source_map_state_flags_changed;
 	widget_class->realize = gtk_source_map_realize;
 	widget_class->css_changed = gtk_source_map_css_changed;
@@ -1471,6 +1564,8 @@ gtk_source_map_init (GtkSourceMap *map)
 	GtkGesture *drag;
 
 	priv = gtk_source_map_get_instance_private (map);
+	priv->width_request = -1;
+	priv->slider_min_height = -1;
 
 	gtk_widget_add_css_class (GTK_WIDGET (map), "GtkSourceMap");
 
@@ -1584,6 +1679,7 @@ gtk_source_map_set_view (GtkSourceMap  *map,
 	if (view != NULL)
 	{
 		connect_view (map, view);
+		gtk_source_map_queue_update (map);
 	}
 
 	g_object_notify_by_pspec (G_OBJECT (map), properties[PROP_VIEW]);
