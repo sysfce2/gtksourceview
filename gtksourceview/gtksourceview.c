@@ -277,13 +277,6 @@ static gboolean       gtk_source_view_extend_selection     (GtkTextView         
                                                             const GtkTextIter       *location,
                                                             GtkTextIter             *start,
                                                             GtkTextIter             *end);
-static void           gtk_source_view_get_lines            (GtkTextView             *text_view,
-                                                            gint                     first_y,
-                                                            gint                     last_y,
-                                                            GArray                  *buffer_coords,
-                                                            GArray                  *line_heights,
-                                                            GArray                  *numbers,
-                                                            gint                    *countp);
 static void           gtk_source_view_move_lines           (GtkSourceView           *view,
                                                             gboolean                 down);
 static void           gtk_source_view_move_words           (GtkSourceView           *view,
@@ -2492,77 +2485,6 @@ gtk_source_view_ensure_redrawn_rect_is_highlighted (GtkSourceView *view,
 	g_free (message);
 }
 
-/* This function is taken from gtk+/tests/testtext.c */
-static void
-gtk_source_view_get_lines (GtkTextView *text_view,
-                           gint         first_y,
-                           gint         last_y,
-                           GArray      *buffer_coords,
-                           GArray      *line_heights,
-                           GArray      *numbers,
-                           gint        *countp)
-{
-	GtkTextIter iter;
-	gint count;
-	gint last_line_num = -1;
-
-	g_array_set_size (buffer_coords, 0);
-	g_array_set_size (numbers, 0);
-	if (line_heights != NULL)
-		g_array_set_size (line_heights, 0);
-
-	/* Get iter at first y */
-	gtk_text_view_get_line_at_y (text_view, &iter, first_y, NULL);
-
-	/* For each iter, get its location and add it to the arrays.
-	 * Stop when we pass last_y */
-	count = 0;
-
-	while (!gtk_text_iter_is_end (&iter))
-	{
-		gint y, height;
-
-		gtk_text_view_get_line_yrange (text_view, &iter, &y, &height);
-
-		g_array_append_val (buffer_coords, y);
-		if (line_heights)
-		{
-			g_array_append_val (line_heights, height);
-		}
-
-		last_line_num = gtk_text_iter_get_line (&iter);
-		g_array_append_val (numbers, last_line_num);
-
-		++count;
-
-		if ((y + height) >= last_y)
-			break;
-
-		gtk_text_iter_forward_line (&iter);
-	}
-
-	if (gtk_text_iter_is_end (&iter))
-	{
-		gint y, height;
-		gint line_num;
-
-		gtk_text_view_get_line_yrange (text_view, &iter, &y, &height);
-
-		line_num = gtk_text_iter_get_line (&iter);
-
-		if (line_num != last_line_num)
-		{
-			g_array_append_val (buffer_coords, y);
-			if (line_heights)
-				g_array_append_val (line_heights, height);
-			g_array_append_val (numbers, line_num);
-			++count;
-		}
-	}
-
-	*countp = count;
-}
-
 /* Another solution to paint the line background is to use the
  * GtkTextTag:paragraph-background property. But there are several issues:
  * - GtkTextTags are per buffer, not per view. It's better to keep the line
@@ -2625,13 +2547,17 @@ gtk_source_view_paint_marks_background (GtkSourceView *view,
 {
 	GtkSourceViewPrivate *priv = gtk_source_view_get_instance_private (view);
 	GtkTextView *text_view;
+	GtkTextBuffer *buffer;
 	GdkRectangle visible_rect;
-	GArray *numbers;
-	GArray *pixels;
-	GArray *heights;
-	gint y1, y2;
-	gint count;
-	gint i;
+	GtkTextIter begin;
+	GtkTextIter end;
+	GSList *marks;
+	GSList *iter;
+	GdkRGBA background;
+	int current_line = -1;
+	int current_y = 0;
+	int current_height = 0;
+	int priority = -1;
 
 	if (priv->source_buffer == NULL ||
 	    !_gtk_source_buffer_has_source_marks (priv->source_buffer))
@@ -2640,94 +2566,81 @@ gtk_source_view_paint_marks_background (GtkSourceView *view,
 	}
 
 	text_view = GTK_TEXT_VIEW (view);
+	buffer = gtk_text_view_get_buffer (text_view);
 
 	gtk_text_view_get_visible_rect (text_view, &visible_rect);
 
-	y1 = visible_rect.y;
-	y2 = y1 + visible_rect.height;
-
-	numbers = g_array_new (FALSE, FALSE, sizeof (gint));
-	pixels = g_array_new (FALSE, FALSE, sizeof (gint));
-	heights = g_array_new (FALSE, FALSE, sizeof (gint));
-
-	/* get the line numbers and y coordinates. */
-	gtk_source_view_get_lines (text_view,
-	                           y1,
-	                           y2,
-	                           pixels,
-	                           heights,
-	                           numbers,
-	                           &count);
-
-	if (count == 0)
-	{
-		gint n = 0;
-		gint y;
-		gint height;
-		GtkTextIter iter;
-
-		gtk_text_buffer_get_start_iter (gtk_text_view_get_buffer (text_view), &iter);
-		gtk_text_view_get_line_yrange (text_view, &iter, &y, &height);
-
-		g_array_append_val (pixels, y);
-		g_array_append_val (heights, height);
-		g_array_append_val (numbers, n);
-		count = 1;
-	}
-
 	GTK_SOURCE_PROFILER_BEGIN_MARK;
 
-	for (i = 0; i < count; ++i)
+	gtk_text_view_get_line_at_y (text_view, &begin, visible_rect.y, NULL);
+	gtk_text_iter_set_line_offset (&begin, 0);
+	gtk_text_view_get_line_at_y (text_view,
+	                             &end,
+	                             visible_rect.y + visible_rect.height,
+	                             NULL);
+	gtk_text_iter_forward_to_line_end (&end);
+
+	marks = _gtk_source_buffer_get_source_marks_in_range (priv->source_buffer,
+	                                                      &begin,
+	                                                      &end,
+	                                                      NULL);
+
+	for (iter = marks; iter != NULL; iter = iter->next)
 	{
-		gint line_to_paint;
-		GSList *marks;
-		GdkRGBA background;
-		int priority;
+		GtkSourceMark *mark = iter->data;
+		GtkTextIter mark_iter;
+		GtkSourceMarkAttributes *attrs;
+		GdkRGBA color;
+		int line;
+		int mark_priority;
 
-		line_to_paint = g_array_index (numbers, gint, i);
+		gtk_text_buffer_get_iter_at_mark (buffer, &mark_iter, GTK_TEXT_MARK (mark));
+		line = gtk_text_iter_get_line (&mark_iter);
 
-		marks = gtk_source_buffer_get_source_marks_at_line (priv->source_buffer,
-		                                                    line_to_paint,
-		                                                    NULL);
-
-		priority = -1;
-
-		while (marks != NULL)
+		if (line != current_line)
 		{
-			GtkSourceMarkAttributes *attrs;
-			gint prio;
-			GdkRGBA bg;
-
-			attrs = gtk_source_view_get_mark_attributes (view,
-			                                             gtk_source_mark_get_category (marks->data),
-			                                             &prio);
-
-			if (attrs != NULL &&
-			    prio > priority &&
-			    gtk_source_mark_attributes_get_background (attrs, &bg))
+			if (priority != -1)
 			{
-				priority = prio;
-				background = bg;
+				gtk_source_view_paint_line_background (view,
+				                                       snapshot,
+				                                       current_y,
+				                                       current_height,
+				                                       &background);
 			}
 
-			marks = g_slist_delete_link (marks, marks);
+			current_line = line;
+			priority = -1;
+			gtk_text_view_get_line_yrange (text_view,
+			                               &mark_iter,
+			                               &current_y,
+			                               &current_height);
 		}
 
-		if (priority != -1)
+		attrs = gtk_source_view_get_mark_attributes (view,
+		                                             gtk_source_mark_get_category (mark),
+		                                             &mark_priority);
+
+		if (attrs != NULL &&
+		    mark_priority > priority &&
+		    gtk_source_mark_attributes_get_background (attrs, &color))
 		{
-			gtk_source_view_paint_line_background (view,
-			                                       snapshot,
-			                                       g_array_index (pixels, gint, i),
-			                                       g_array_index (heights, gint, i),
-			                                       &background);
+			priority = mark_priority;
+			background = color;
 		}
 	}
 
-	GTK_SOURCE_PROFILER_END_MARK ("GtkSourceView::paint-marks-background", NULL);
+	if (priority != -1)
+	{
+		gtk_source_view_paint_line_background (view,
+		                                       snapshot,
+		                                       current_y,
+		                                       current_height,
+		                                       &background);
+	}
 
-	g_array_free (heights, TRUE);
-	g_array_free (pixels, TRUE);
-	g_array_free (numbers, TRUE);
+	g_slist_free (marks);
+
+	GTK_SOURCE_PROFILER_END_MARK ("GtkSourceView::paint-marks-background", NULL);
 }
 
 static int

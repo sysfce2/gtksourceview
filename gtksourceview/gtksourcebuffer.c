@@ -2071,6 +2071,30 @@ gtk_source_buffer_get_source_marks_at_line (GtkSourceBuffer *buffer,
 	return _gtk_source_marks_sequence_get_marks_in_range (seq, &start, &end);
 }
 
+GSList *
+_gtk_source_buffer_get_source_marks_in_range (GtkSourceBuffer   *buffer,
+                                              const GtkTextIter *start,
+                                              const GtkTextIter *end,
+                                              const char        *category)
+{
+	GtkSourceMarksSequence *seq;
+
+	g_return_val_if_fail (GTK_SOURCE_IS_BUFFER (buffer), NULL);
+	g_return_val_if_fail (start != NULL, NULL);
+	g_return_val_if_fail (end != NULL, NULL);
+	g_return_val_if_fail (gtk_text_iter_get_buffer (start) == GTK_TEXT_BUFFER (buffer), NULL);
+	g_return_val_if_fail (gtk_text_iter_get_buffer (end) == GTK_TEXT_BUFFER (buffer), NULL);
+
+	seq = get_marks_sequence (buffer, category);
+
+	if (seq == NULL)
+	{
+		return NULL;
+	}
+
+	return _gtk_source_marks_sequence_get_marks_in_range (seq, start, end);
+}
+
 /**
  * gtk_source_buffer_remove_source_marks:
  * @buffer: a #GtkSourceBuffer.
