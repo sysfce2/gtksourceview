@@ -177,6 +177,10 @@ typedef struct
 	GdkRectangle slider_area;
 	int slider_width;
 
+	/* Actual content heights when the adjustments are allocation-clamped. */
+	double view_content_height;
+	double map_content_height;
+
 	/* Cached measurements which are invalidated by CSS or context changes. */
 	PangoContext *width_context;
 	guint width_context_serial;
@@ -199,6 +203,7 @@ typedef struct
 	gulong view_vadj_changed_handler;
 
 	/* Signals connected indirectly to the buffer */
+	gulong buffer_changed_handler;
 	gulong buffer_notify_style_scheme_handler;
 
 	/* Tick callback to queue work until the next frame to
@@ -238,22 +243,104 @@ G_DEFINE_TYPE_WITH_PRIVATE (GtkSourceMap, gtk_source_map, GTK_SOURCE_TYPE_VIEW)
 static GParamSpec *properties[N_PROPERTIES];
 
 static void
+gtk_source_map_invalidate_content_heights (GtkSourceMap *map)
+{
+	GtkSourceMapPrivate *priv = gtk_source_map_get_instance_private (map);
+
+	g_assert (GTK_SOURCE_IS_MAP (map));
+
+	priv->view_content_height = -1.0;
+	priv->map_content_height = -1.0;
+}
+
+static double
+get_content_height (GtkTextView   *view,
+                    GtkAdjustment *adjustment,
+                    double        *cached_height)
+{
+	double adjustment_height;
+	double page_size;
+
+	g_assert (GTK_IS_TEXT_VIEW (view));
+	g_assert (GTK_IS_ADJUSTMENT (adjustment));
+	g_assert (cached_height != NULL);
+
+	adjustment_height = gtk_adjustment_get_upper (adjustment) -
+	                    gtk_adjustment_get_lower (adjustment);
+	page_size = gtk_adjustment_get_page_size (adjustment);
+
+	/* GtkTextView expands upper to page-size when the allocation is taller
+	 * than the contents. Otherwise the adjustment has the exact height and
+	 * no text geometry needs to be queried.
+	 */
+	if (adjustment_height > page_size)
+	{
+		*cached_height = adjustment_height;
+		return adjustment_height;
+	}
+
+	if (*cached_height < 0.0)
+	{
+		GtkWidget *widget = GTK_WIDGET (view);
+		GtkWidget *gutter;
+		int content_height;
+		int ignored;
+
+		/* GtkTextView's measurement uses its cached layout height, which is
+		 * also the unclamped height used to configure the adjustment.
+		 */
+		GTK_WIDGET_CLASS (gtk_source_map_parent_class)->measure (widget,
+		                                                         GTK_ORIENTATION_VERTICAL,
+		                                                         gtk_widget_get_width (widget),
+		                                                         &ignored,
+		                                                         &content_height,
+		                                                         NULL,
+		                                                         NULL);
+
+		if ((gutter = gtk_text_view_get_gutter (view, GTK_TEXT_WINDOW_TOP)))
+		{
+			gtk_widget_measure (gutter,
+			                    GTK_ORIENTATION_VERTICAL,
+			                    -1,
+			                    &ignored,
+			                    NULL,
+			                    NULL,
+			                    NULL);
+			content_height -= ignored;
+		}
+
+		if ((gutter = gtk_text_view_get_gutter (view, GTK_TEXT_WINDOW_BOTTOM)))
+		{
+			gtk_widget_measure (gutter,
+			                    GTK_ORIENTATION_VERTICAL,
+			                    -1,
+			                    &ignored,
+			                    NULL,
+			                    NULL,
+			                    NULL);
+			content_height -= ignored;
+		}
+
+		*cached_height = MAX (0, content_height);
+	}
+
+	return *cached_height;
+}
+
+static void
 get_slider_position (GtkSourceMap *map,
-                     int           height,
                      GdkRectangle *slider_area)
 {
 	GtkSourceMapPrivate *priv = gtk_source_map_get_instance_private (map);
 	GtkAdjustment *child_vadj;
 	GtkAdjustment *vadj;
 	double child_lower;
-	double child_upper;
 	double child_value;
 	double lower;
-	double upper;
 	double value;
 	double page_size;
-	double range;
-	double child_range;
+	double view_height;
+	double map_height;
 	double slider_height;
 	double slider_y;
 
@@ -265,29 +352,34 @@ get_slider_position (GtkSourceMap *map,
 	child_vadj = gtk_scrollable_get_vadjustment (GTK_SCROLLABLE (map));
 
 	lower = gtk_adjustment_get_lower (vadj);
-	upper = gtk_adjustment_get_upper (vadj);
 	value = gtk_adjustment_get_value (vadj);
 	page_size = gtk_adjustment_get_page_size (vadj);
-	range = upper - lower;
+	view_height = get_content_height (GTK_TEXT_VIEW (priv->view),
+	                                  vadj,
+	                                  &priv->view_content_height);
 
 	child_lower = gtk_adjustment_get_lower (child_vadj);
-	child_upper = gtk_adjustment_get_upper (child_vadj);
 	child_value = gtk_adjustment_get_value (child_vadj);
-	child_range = child_upper - child_lower;
+	map_height = get_content_height (GTK_TEXT_VIEW (map),
+	                                 child_vadj,
+	                                 &priv->map_content_height);
 
 	slider_area->x = 0;
 	slider_area->width = priv->slider_width;
 
-	if (range <= 0.0 || child_range <= 0.0 || page_size >= range)
+	if (view_height <= 0.0 || map_height <= 0.0)
 	{
 		slider_y = 0.0;
-		slider_height = height;
+		slider_height = 0.0;
 	}
 	else
 	{
-		slider_y = ((CLAMP (value, lower, upper) - lower) / range) * child_range;
+		double visible_begin = CLAMP (value - lower, 0.0, view_height);
+		double visible_end = CLAMP (visible_begin + page_size, 0.0, view_height);
+
+		slider_y = (visible_begin / view_height) * map_height;
 		slider_y -= child_value - child_lower;
-		slider_height = CLAMP (page_size / range, 0.0, 1.0) * child_range;
+		slider_height = ((visible_end - visible_begin) / view_height) * map_height;
 	}
 
 	slider_area->y = floor (slider_y);
@@ -310,7 +402,7 @@ gtk_source_map_allocate_slider (GtkSourceMap *map)
 	if (priv->view == NULL || width == 0 || height == 0)
 		return;
 
-	get_slider_position (map, height, &area);
+	get_slider_position (map, &area);
 
 	if (priv->slider_min_height < 0)
 	{
@@ -657,9 +749,23 @@ static void
 view_vadj_changed (GtkSourceMap  *map,
                    GtkAdjustment *vadj)
 {
+	GtkSourceMapPrivate *priv = gtk_source_map_get_instance_private (map);
+
 	g_assert (GTK_SOURCE_IS_MAP (map));
 	g_assert (GTK_IS_ADJUSTMENT (vadj));
 
+	priv->view_content_height = -1.0;
+	gtk_source_map_queue_update (map);
+}
+
+static void
+buffer_changed (GtkSourceMap  *map,
+                GtkTextBuffer *buffer)
+{
+	g_assert (GTK_SOURCE_IS_MAP (map));
+	g_assert (GTK_IS_TEXT_BUFFER (buffer));
+
+	gtk_source_map_invalidate_content_heights (map);
 	gtk_source_map_queue_update (map);
 }
 
@@ -682,6 +788,13 @@ connect_buffer (GtkSourceMap  *map,
 	priv->buffer = buffer;
 	g_object_add_weak_pointer (G_OBJECT (buffer), (gpointer *)&priv->buffer);
 
+	priv->buffer_changed_handler =
+		g_signal_connect_object (buffer,
+		                         "changed",
+		                         G_CALLBACK (buffer_changed),
+		                         map,
+		                         G_CONNECT_SWAPPED);
+
 	priv->buffer_notify_style_scheme_handler =
 		g_signal_connect_object (buffer,
 		                         "notify::style-scheme",
@@ -702,6 +815,13 @@ disconnect_buffer (GtkSourceMap  *map)
 	if (priv->buffer == NULL)
 	{
 		return;
+	}
+
+	if (priv->buffer_changed_handler != 0)
+	{
+		g_signal_handler_disconnect (priv->buffer,
+		                             priv->buffer_changed_handler);
+		priv->buffer_changed_handler = 0;
 	}
 
 	if (priv->buffer_notify_style_scheme_handler != 0)
@@ -736,6 +856,9 @@ view_notify_buffer (GtkSourceMap  *map,
 	{
 		connect_buffer (map, buffer);
 	}
+
+	gtk_source_map_invalidate_content_heights (map);
+	gtk_source_map_queue_update (map);
 }
 
 static void
@@ -1105,6 +1228,7 @@ disconnect_view (GtkSourceMap *map)
 	priv->view = NULL;
 	priv->adjustment_handlers_blocked = FALSE;
 	priv->slider_allocated = FALSE;
+	gtk_source_map_invalidate_content_heights (map);
 	gtk_source_map_invalidate_width (map);
 }
 
@@ -1201,9 +1325,6 @@ gtk_source_map_drag_update (GtkSourceMap   *map,
                             GtkGestureDrag *drag)
 {
 	GtkSourceMapPrivate *priv = gtk_source_map_get_instance_private (map);
-	GtkTextBuffer *buffer;
-	GdkRectangle area;
-	GtkTextIter iter;
 	double yratio;
 	double begin_x;
 	double begin_y;
@@ -1230,10 +1351,6 @@ gtk_source_map_drag_update (GtkSourceMap   *map,
 	                                                         &ignored, &real_height, &ignored, &ignored);
 
 	height = MIN (real_height, widget_height) - gtk_text_view_get_bottom_margin (GTK_TEXT_VIEW (map));
-
-	buffer = gtk_text_view_get_buffer (GTK_TEXT_VIEW (map));
-	gtk_text_buffer_get_end_iter (buffer, &iter);
-	gtk_text_view_get_iter_location (GTK_TEXT_VIEW (map), &iter, &area);
 
 	yratio = (y - priv->slider_y_shift) / (double)height;
 
@@ -1435,6 +1552,7 @@ gtk_source_map_css_changed (GtkWidget         *widget,
 	GTK_WIDGET_CLASS (gtk_source_map_parent_class)->css_changed (widget, change);
 
 	gtk_source_map_invalidate_width (GTK_SOURCE_MAP (widget));
+	gtk_source_map_invalidate_content_heights (GTK_SOURCE_MAP (widget));
 
 	priv->slider_min_height = -1;
 	priv->slider_allocated = FALSE;
@@ -1470,6 +1588,8 @@ gtk_source_map_size_allocate (GtkWidget *widget,
 	g_assert (GTK_SOURCE_IS_MAP (map));
 
 	GTK_WIDGET_CLASS (gtk_source_map_parent_class)->size_allocate (widget, width, height, baseline);
+
+	gtk_source_map_invalidate_content_heights (map);
 
 	G_GNUC_BEGIN_IGNORE_DEPRECATIONS {
 		GtkStyleContext *style_context = gtk_widget_get_style_context (widget);
@@ -1564,6 +1684,8 @@ gtk_source_map_init (GtkSourceMap *map)
 	GtkGesture *drag;
 
 	priv = gtk_source_map_get_instance_private (map);
+	priv->view_content_height = -1.0;
+	priv->map_content_height = -1.0;
 	priv->width_request = -1;
 	priv->slider_min_height = -1;
 
